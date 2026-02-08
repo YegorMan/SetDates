@@ -350,6 +350,163 @@ def test_R17_no_original_copies(base: Path):
           f"найдены: {originals}")
 
 
+def test_R14b_base_dir_date(tmp_root: Path):
+    """R14b-d: дата из корневой директории наследуется подпапками без дат."""
+    print("\n── R14b-d: Наследование даты из корневой директории ──")
+
+    # Создаём отдельную структуру, где base_dir сам содержит дату
+    base2 = tmp_root / "2019 Архив"
+    if base2.exists():
+        shutil.rmtree(base2)
+    base2.mkdir(parents=True)
+
+    # Подпапка без даты
+    create_jpg(base2 / "Разное" / "orphan.jpg")
+    # Глубоко вложенная подпапка без даты
+    create_jpg(base2 / "без даты" / "sub" / "deep_orphan.jpg")
+    # Подпапка с собственной датой (ближайшая должна победить)
+    create_jpg(base2 / "2023.05.15 Отпуск" / "pic.jpg")
+
+    snap = snapshot_tree(base2)
+
+    # Apply
+    r = run_script(base2, "--apply")
+    check("R14b-apply", "--apply на 2019 Архив/ завершился без ошибок",
+          r.returncode == 0,
+          r.stderr if r.stderr else r.stdout[-200:])
+
+    # R14b: файл в подпапке без даты → дата из base_dir
+    orphan = base2 / "Разное" / "orphan.jpg"
+    actual_b = get_mtime(orphan).strftime("%Y-%m-%d")
+    check("R14b", "orphan.jpg в Разное/ → 2019-01-01 (из корневой)",
+          actual_b == "2019-01-01",
+          f"факт={actual_b}")
+
+    # R14c: файл глубоко во вложенных подпапках без дат → дата из base_dir
+    deep = base2 / "без даты" / "sub" / "deep_orphan.jpg"
+    actual_c = get_mtime(deep).strftime("%Y-%m-%d")
+    check("R14c", "deep_orphan.jpg в без даты/sub/ → 2019-01-01 (из корневой)",
+          actual_c == "2019-01-01",
+          f"факт={actual_c}")
+
+    # R14d: файл в подпапке с собственной датой → дата из подпапки, НЕ из корневой
+    pic = base2 / "2023.05.15 Отпуск" / "pic.jpg"
+    actual_d = get_mtime(pic).strftime("%Y-%m-%d")
+    check("R14d", "pic.jpg в 2023.05.15 Отпуск/ → 2023-05-15 (ближайшая, не корневая)",
+          actual_d == "2023-05-15",
+          f"факт={actual_d}")
+
+    # Безопасность: ни один файл не удалён
+    snap_after = snapshot_tree(base2)
+    before_keys = set(snap.keys())
+    after_keys = set(snap_after.keys())
+    deleted = before_keys - after_keys
+    check("R14b-safety", "ни один файл/папка не удалён",
+          len(deleted) == 0,
+          f"удалены: {sorted(deleted)}")
+
+
+def test_R18_dash_dates_not_matched(tmp_root: Path):
+    """R18: папки с дефисными датами (2009-09-25) НЕ парсятся как дата."""
+    print("\n── R18: Дефисные даты не парсятся, точечные — парсятся ──")
+
+    # Воспроизводим точный сценарий пользователя:
+    # 2009 год/2009.09.24-25 КЭС-Баскет/2009-09-25 Йошкар-Ола/_DSC4897.JPG
+    base3 = tmp_root / "test_dash_dates"
+    if base3.exists():
+        shutil.rmtree(base3)
+
+    deep_dir = (base3
+                / "2009 год"
+                / "2009.09.24-25 КЭС-Баскет 2009"
+                / "2009-09-25 Йошкар-Ола День 3")
+    create_jpg(deep_dir / "_DSC4897.JPG")
+
+    # Файл в папке только с дефисной датой (не должна парситься)
+    create_jpg(base3 / "2009-09-25 Концерт" / "photo.jpg")
+
+    # Файл в папке с точечной датой + дефисной подпапкой
+    create_jpg(base3 / "2020.03.15 Поездка" / "2020-03-16 День 2" / "img.jpg")
+
+    r = run_script(base3, "--apply")
+    check("R18-apply", "--apply завершился без ошибок",
+          r.returncode == 0,
+          r.stderr if r.stderr else r.stdout[-200:])
+
+    # R18a: главный баг — файл должен получить дату 2009-09-24 (из 2009.09.24-25),
+    #        а НЕ 2009-01-01 (из «2009» в имени «2009-09-25 Йошкар-Ола»)
+    f1 = deep_dir / "_DSC4897.JPG"
+    actual1 = get_mtime(f1).strftime("%Y-%m-%d")
+    check("R18a", "_DSC4897.JPG → 2009-09-24 (из 2009.09.24-25, не из 2009-09-25)",
+          actual1 == "2009-09-24",
+          f"факт={actual1}")
+
+    # R18b: папка с дефисной датой без точечного родителя → без даты (пропускается)
+    f2 = base3 / "2009-09-25 Концерт" / "photo.jpg"
+    mtime2 = get_mtime(f2)
+    check("R18b", "photo.jpg в 2009-09-25 Концерт/ → НЕ обработан (дефис — не дата)",
+          mtime2.year >= 2026,
+          f"mtime={mtime2}")
+
+    # R18c: точечная дата побеждает, дефисная подпапка пропускается
+    f3 = base3 / "2020.03.15 Поездка" / "2020-03-16 День 2" / "img.jpg"
+    actual3 = get_mtime(f3).strftime("%Y-%m-%d")
+    check("R18c", "img.jpg → 2020-03-15 (из 2020.03.15, не из 2020-03-16)",
+          actual3 == "2020-03-15",
+          f"факт={actual3}")
+
+    # Безопасность
+    snap_after = snapshot_tree(base3)
+    n_files = len([v for v in snap_after.values() if v["type"] == "file"])
+    check("R18-safety", f"все {n_files} файлов на месте", n_files == 3,
+          f"файлов: {n_files}")
+
+
+def test_R19_date_ranges(tmp_root: Path):
+    """R19: диапазоны месяцев и дней в именах папок."""
+    print("\n── R19: Диапазоны дат (месяцев и дней) ──")
+
+    base19 = tmp_root / "test_date_ranges"
+    if base19.exists():
+        shutil.rmtree(base19)
+
+    # R19a: диапазон месяцев  "2018.01-03 зима" → 2018-01-01
+    create_jpg(base19 / "2018.01-03 зима" / "winter.jpg")
+    # R19b: полная дата + диапазон мес.дней  "2018.01.03-02.05 зима" → 2018-01-03
+    create_jpg(base19 / "2018.01.03-02.05 зима" / "trip.jpg")
+    # R19c: полная дата + диапазон дней  "2018.01.03-04 зима" → 2018-01-03
+    create_jpg(base19 / "2018.01.03-04 зима" / "photo.jpg")
+
+    r = run_script(base19, "--apply")
+    check("R19-apply", "--apply завершился без ошибок",
+          r.returncode == 0,
+          r.stderr if r.stderr else r.stdout[-200:])
+
+    f1 = base19 / "2018.01-03 зима" / "winter.jpg"
+    actual1 = get_mtime(f1).strftime("%Y-%m-%d")
+    check("R19a", "winter.jpg → 2018-01-01 (из 2018.01-03, диапазон месяцев)",
+          actual1 == "2018-01-01",
+          f"факт={actual1}")
+
+    f2 = base19 / "2018.01.03-02.05 зима" / "trip.jpg"
+    actual2 = get_mtime(f2).strftime("%Y-%m-%d")
+    check("R19b", "trip.jpg → 2018-01-03 (из 2018.01.03-02.05, начальная дата)",
+          actual2 == "2018-01-03",
+          f"факт={actual2}")
+
+    f3 = base19 / "2018.01.03-04 зима" / "photo.jpg"
+    actual3 = get_mtime(f3).strftime("%Y-%m-%d")
+    check("R19c", "photo.jpg → 2018-01-03 (из 2018.01.03-04, диапазон дней)",
+          actual3 == "2018-01-03",
+          f"факт={actual3}")
+
+    # Безопасность
+    snap_after = snapshot_tree(base19)
+    n_files = len([v for v in snap_after.values() if v["type"] == "file"])
+    check("R19-safety", f"все {n_files} файлов на месте", n_files == 3,
+          f"файлов: {n_files}")
+
+
 def test_static_analysis():
     """Статический анализ: нет опасных операций в коде."""
     print("\n── Статический анализ: нет опасных операций ──")
@@ -402,6 +559,9 @@ if __name__ == "__main__":
         test_R12_idempotency(base)
         test_R17_no_original_copies(base)
         test_R08_R09_R10_safety(base, snap_before)
+        test_R14b_base_dir_date(tmp_root)
+        test_R18_dash_dates_not_matched(tmp_root)
+        test_R19_date_ranges(tmp_root)
 
     finally:
         # Очистка временной директории
