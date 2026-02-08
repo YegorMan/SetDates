@@ -59,12 +59,29 @@ from typing import Optional, Tuple
 #   2018 год              → только год (месяц=01, день=01)
 #   2018.01 зима          → год + месяц (день=01)
 #   2026.01.01 ...        → полная дата
+#   2018.01-03 зима       → диапазон месяцев (берём начало: 01.01)
 #   2026.01.29-31 ...     → диапазон дней (берём начало)
 #   2026.01.28-02.11 ...  → диапазон мес.дней (берём начало)
 # Мы всегда берём ПЕРВУЮ (начальную) дату.
-# Lookahead (?=[\s\-]|$) гарантирует, что после даты идёт
-# пробел, дефис или конец строки (а не продолжение цифр/точек).
-DATE_PATTERN = re.compile(r'^(\d{4})(?:\.(\d{2})(?:\.(\d{2}))?)?(?=[\s\-]|$)')
+#
+# Разделитель — ТОЛЬКО точка. Дефис допускается в lookahead после
+# YYYY.MM.DD (диапазон дней: 2024.01.29-31) и после YYYY.MM
+# (диапазон месяцев: 2018.01-03).
+# После YYYY допускается только пробел или конец строки,
+# чтобы «2009-09-25» НЕ матчилось как год «2009».
+DATE_PATTERN = re.compile(
+    r'^(\d{4})'
+    r'(?:'
+        r'\.(\d{2})'
+        r'(?:'
+            r'\.(\d{2})(?=[\s\-]|$)'    # YYYY.MM.DD — дефис допустим (диапазон дней)
+        r'|'
+            r'(?=[\s\-]|$)'             # YYYY.MM — дефис допустим (диапазон месяцев)
+        r')'
+    r'|'
+        r'(?=\s|$)'                      # YYYY — только пробел или конец
+    r')'
+)
 
 # ─── Функции ─────────────────────────────────────────────────────────────────
 
@@ -114,14 +131,16 @@ def find_date_for_file(file_path: Path, base_dir: Path) -> Tuple[Optional[dateti
     if date is not None:
         return date, file_stem, "file"
 
-    # 2. Поднимаемся по дереву каталогов
+    # 2. Поднимаемся по дереву каталогов (включая корневую директорию)
     current = file_path.parent.resolve()
     base = base_dir.resolve()
 
-    while current != base and current != current.parent:
+    while True:
         date = extract_date_from_name(current.name)
         if date is not None:
             return date, current.name, "folder"
+        if current == base or current == current.parent:
+            break
         current = current.parent
 
     return None, None, ""
