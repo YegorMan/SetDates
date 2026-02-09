@@ -507,6 +507,257 @@ def test_R19_date_ranges(tmp_root: Path):
           f"файлов: {n_files}")
 
 
+def test_R20_compact_dates_rejected(tmp_root: Path):
+    """R20: слитные даты (20180101) НЕ воспринимаются как даты."""
+    print("\n── R20: Слитные даты (без точек) не парсятся ──")
+
+    base20 = tmp_root / "test_compact_dates"
+    if base20.exists():
+        shutil.rmtree(base20)
+
+    # Папки со слитными датами — не должны парситься
+    create_jpg(base20 / "20180101 Новый год" / "a.jpg")
+    create_jpg(base20 / "201806 лето" / "b.jpg")
+    create_jpg(base20 / "20180115" / "c.jpg")
+
+    r = run_script(base20, "--apply")
+    check("R20-apply", "--apply завершился без ошибок",
+          r.returncode == 0,
+          r.stderr if r.stderr else r.stdout[-200:])
+
+    # Все файлы должны остаться с текущим mtime (не обработаны)
+    for rel, fname in [("20180101 Новый год", "a.jpg"),
+                       ("201806 лето", "b.jpg"),
+                       ("20180115", "c.jpg")]:
+        f = base20 / rel / fname
+        mtime = get_mtime(f)
+        check(f"R20-{fname}", f"{fname} в {rel}/ → НЕ обработан (слитная дата)",
+              mtime.year >= 2026,
+              f"mtime={mtime}")
+
+    # Безопасность
+    snap_after = snapshot_tree(base20)
+    n_files = len([v for v in snap_after.values() if v["type"] == "file"])
+    check("R20-safety", f"все {n_files} файлов на месте", n_files == 3,
+          f"файлов: {n_files}")
+
+
+def run_script_refine(base: Path, *extra_args) -> subprocess.CompletedProcess:
+    """Запускает скрипт с --refine и дополнительными аргументами."""
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), str(base), "--refine"] + list(extra_args),
+        capture_output=True, text=True, timeout=120,
+    )
+
+
+def test_R21_refine_mode(tmp_root: Path):
+    """R21: Режим --refine — уточнение дат из имён файлов."""
+    print("\n── R21: Режим --refine — уточнение дат из имён файлов ──")
+
+    base21 = tmp_root / "test_refine"
+    if base21.exists():
+        shutil.rmtree(base21)
+
+    # ── Case 1: Папка = YYYY ──
+    # 1a: год совпадает → берём из файла
+    create_jpg(base21 / "2019 год" / "IMG_20190102_160000.jpg")
+    # 1b: год не совпадает → оставляем папку
+    create_jpg(base21 / "2019 год" / "IMG_20181231_180000.jpg")
+
+    # ── Case 2: Папка = YYYY.MM ──
+    # 2a: год+месяц совпадают → берём из файла
+    create_jpg(base21 / "2019.01 Зима" / "IMG_20190115_160000.jpg")
+    # 2b: месяц не совпадает → оставляем папку
+    create_jpg(base21 / "2019.01 Зима" / "IMG_20190215_160000.jpg")
+
+    # ── Case 3: Папка = YYYY.MM.DD ──
+    # 3a: полная дата совпадает → берём из файла (добавляет время)
+    create_jpg(base21 / "2019.01.02 Событие" / "IMG_20190102_160000.jpg")
+    # 3b: день не совпадает → оставляем папку
+    create_jpg(base21 / "2019.01.02 Событие" / "IMG_20190103_160000.jpg")
+
+    # ── Case 4: Папка = YYYY.MM.DD-DD (диапазон дней) ──
+    # 4a: день в диапазоне → берём из файла
+    create_jpg(base21 / "2019.01.02-05 Поездка" / "IMG_20190104_160000.jpg")
+    # 4b: день вне диапазона → оставляем папку
+    create_jpg(base21 / "2019.01.02-05 Поездка" / "IMG_20190110_160000.jpg")
+
+    # ── Case 5: Папка = YYYY.MM-MM (диапазон месяцев) ──
+    # 5a: месяц в диапазоне → берём из файла
+    create_jpg(base21 / "2019.01-03 Зима" / "IMG_20190215_160000.jpg")
+    # 5b: месяц вне диапазона → оставляем папку
+    create_jpg(base21 / "2019.01-03 Зима" / "IMG_20190615_160000.jpg")
+
+    # ── Case 6: Папка = YYYY.MM.DD-MM.DD (кросс-месячный диапазон) ──
+    # 6a: дата в диапазоне → берём из файла
+    create_jpg(base21 / "2019.06.28-07.05 Поездка" / "IMG_20190702_160000.jpg")
+    # 6b: дата вне диапазона → оставляем папку
+    create_jpg(base21 / "2019.06.28-07.05 Поездка" / "IMG_20190715_160000.jpg")
+
+    # ── Case 7: Нет даты в имени файла ──
+    create_jpg(base21 / "2019.01.02 Событие" / "_DSC4897.JPG")
+
+    # ── Case 8: Нет даты в папке ──
+    create_jpg(base21 / "Разное" / "IMG_20190102_160000.jpg")
+
+    snap_before = snapshot_tree(base21)
+
+    # ── Тест readonly: --refine без --apply ──
+    print("\n  ── R21 readonly: --refine без --apply ──")
+    snap_pre_readonly = snapshot_tree(base21)
+    r_ro = run_script_refine(base21)
+    snap_post_readonly = snapshot_tree(base21)
+
+    check("R21-ro-exit", "--refine (readonly) завершился без ошибок",
+          r_ro.returncode == 0,
+          r_ro.stderr if r_ro.stderr else r_ro.stdout[-300:])
+
+    # Проверяем, что ни один mtime не изменился в readonly-режиме
+    mtimes_changed = [
+        k for k in snap_pre_readonly
+        if snap_pre_readonly[k]["type"] == "file"
+        and k in snap_post_readonly
+        and abs(snap_pre_readonly[k]["mtime"] - snap_post_readonly[k]["mtime"]) > 0.01
+    ]
+    check("R21-ro-nochg", "readonly-режим не изменяет файлы",
+          len(mtimes_changed) == 0,
+          f"изменённые: {mtimes_changed}")
+
+    # Проверяем, что вывод содержит [УТОЧНЕНИЕ] и [КОНФЛИКТ]
+    check("R21-ro-refine", "вывод содержит [УТОЧНЕНИЕ]",
+          "УТОЧНЕНИЕ" in r_ro.stdout,
+          r_ro.stdout[-500:])
+    check("R21-ro-conflict", "вывод содержит [КОНФЛИКТ]",
+          "КОНФЛИКТ" in r_ro.stdout,
+          r_ro.stdout[-500:])
+
+    # ── Тест apply: --refine --apply ──
+    print("\n  ── R21 apply: --refine --apply ──")
+    r_ap = run_script_refine(base21, "--apply")
+    check("R21-apply", "--refine --apply завершился без ошибок",
+          r_ap.returncode == 0,
+          r_ap.stderr if r_ap.stderr else r_ap.stdout[-300:])
+
+    # ── Case 1a: YYYY, год совпадает → дата из файла ──
+    f1a = base21 / "2019 год" / "IMG_20190102_160000.jpg"
+    m1a = get_mtime(f1a)
+    check("R21-1a", "IMG_20190102 в '2019 год' → 2019-01-02 16:00",
+          m1a.strftime("%Y-%m-%d %H:%M") == "2019-01-02 16:00",
+          f"факт={m1a}")
+
+    # ── Case 1b: YYYY, год не совпадает → дата папки ──
+    f1b = base21 / "2019 год" / "IMG_20181231_180000.jpg"
+    m1b = get_mtime(f1b)
+    check("R21-1b", "IMG_20181231 в '2019 год' → 2019-01-01 12:00 (конфликт)",
+          m1b.strftime("%Y-%m-%d %H:%M") == "2019-01-01 12:00",
+          f"факт={m1b}")
+
+    # ── Case 2a: YYYY.MM, год+месяц совпадают → дата из файла ──
+    f2a = base21 / "2019.01 Зима" / "IMG_20190115_160000.jpg"
+    m2a = get_mtime(f2a)
+    check("R21-2a", "IMG_20190115 в '2019.01 Зима' → 2019-01-15 16:00",
+          m2a.strftime("%Y-%m-%d %H:%M") == "2019-01-15 16:00",
+          f"факт={m2a}")
+
+    # ── Case 2b: YYYY.MM, месяц не совпадает → дата папки ──
+    f2b = base21 / "2019.01 Зима" / "IMG_20190215_160000.jpg"
+    m2b = get_mtime(f2b)
+    check("R21-2b", "IMG_20190215 в '2019.01 Зима' → 2019-01-01 12:00 (конфликт)",
+          m2b.strftime("%Y-%m-%d %H:%M") == "2019-01-01 12:00",
+          f"факт={m2b}")
+
+    # ── Case 3a: YYYY.MM.DD, полная дата совпадает → дата из файла (с временем) ──
+    f3a = base21 / "2019.01.02 Событие" / "IMG_20190102_160000.jpg"
+    m3a = get_mtime(f3a)
+    check("R21-3a", "IMG_20190102 в '2019.01.02 Событие' → 2019-01-02 16:00",
+          m3a.strftime("%Y-%m-%d %H:%M") == "2019-01-02 16:00",
+          f"факт={m3a}")
+
+    # ── Case 3b: YYYY.MM.DD, день не совпадает → дата папки ──
+    f3b = base21 / "2019.01.02 Событие" / "IMG_20190103_160000.jpg"
+    m3b = get_mtime(f3b)
+    check("R21-3b", "IMG_20190103 в '2019.01.02 Событие' → 2019-01-02 12:00 (конфликт)",
+          m3b.strftime("%Y-%m-%d %H:%M") == "2019-01-02 12:00",
+          f"факт={m3b}")
+
+    # ── Case 4a: YYYY.MM.DD-DD, день в диапазоне → дата из файла ──
+    f4a = base21 / "2019.01.02-05 Поездка" / "IMG_20190104_160000.jpg"
+    m4a = get_mtime(f4a)
+    check("R21-4a", "IMG_20190104 в '2019.01.02-05' → 2019-01-04 16:00 (в диапазоне)",
+          m4a.strftime("%Y-%m-%d %H:%M") == "2019-01-04 16:00",
+          f"факт={m4a}")
+
+    # ── Case 4b: YYYY.MM.DD-DD, день вне диапазона → дата папки ──
+    f4b = base21 / "2019.01.02-05 Поездка" / "IMG_20190110_160000.jpg"
+    m4b = get_mtime(f4b)
+    check("R21-4b", "IMG_20190110 в '2019.01.02-05' → 2019-01-02 12:00 (вне диапазона)",
+          m4b.strftime("%Y-%m-%d %H:%M") == "2019-01-02 12:00",
+          f"факт={m4b}")
+
+    # ── Case 5a: YYYY.MM-MM, месяц в диапазоне → дата из файла ──
+    f5a = base21 / "2019.01-03 Зима" / "IMG_20190215_160000.jpg"
+    m5a = get_mtime(f5a)
+    check("R21-5a", "IMG_20190215 в '2019.01-03' → 2019-02-15 16:00 (в диапазоне месяцев)",
+          m5a.strftime("%Y-%m-%d %H:%M") == "2019-02-15 16:00",
+          f"факт={m5a}")
+
+    # ── Case 5b: YYYY.MM-MM, месяц вне диапазона → дата папки ──
+    f5b = base21 / "2019.01-03 Зима" / "IMG_20190615_160000.jpg"
+    m5b = get_mtime(f5b)
+    check("R21-5b", "IMG_20190615 в '2019.01-03' → 2019-01-01 12:00 (вне диапазона)",
+          m5b.strftime("%Y-%m-%d %H:%M") == "2019-01-01 12:00",
+          f"факт={m5b}")
+
+    # ── Case 6a: YYYY.MM.DD-MM.DD, дата в кросс-месячном диапазоне → дата из файла ──
+    f6a = base21 / "2019.06.28-07.05 Поездка" / "IMG_20190702_160000.jpg"
+    m6a = get_mtime(f6a)
+    check("R21-6a", "IMG_20190702 в '2019.06.28-07.05' → 2019-07-02 16:00 (в диапазоне)",
+          m6a.strftime("%Y-%m-%d %H:%M") == "2019-07-02 16:00",
+          f"факт={m6a}")
+
+    # ── Case 6b: YYYY.MM.DD-MM.DD, дата вне кросс-месячного диапазона → дата папки ──
+    f6b = base21 / "2019.06.28-07.05 Поездка" / "IMG_20190715_160000.jpg"
+    m6b = get_mtime(f6b)
+    check("R21-6b", "IMG_20190715 в '2019.06.28-07.05' → 2019-06-28 12:00 (вне диапазона)",
+          m6b.strftime("%Y-%m-%d %H:%M") == "2019-06-28 12:00",
+          f"факт={m6b}")
+
+    # ── Case 7: Нет даты в имени файла → дата папки ──
+    f7 = base21 / "2019.01.02 Событие" / "_DSC4897.JPG"
+    m7 = get_mtime(f7)
+    check("R21-7", "_DSC4897.JPG в '2019.01.02' → 2019-01-02 12:00 (нет даты в имени)",
+          m7.strftime("%Y-%m-%d %H:%M") == "2019-01-02 12:00",
+          f"факт={m7}")
+
+    # ── Case 8: Нет даты в папке → не обработан ──
+    f8 = base21 / "Разное" / "IMG_20190102_160000.jpg"
+    m8 = get_mtime(f8)
+    check("R21-8", "IMG_20190102 в 'Разное' → НЕ обработан (нет даты в папке)",
+          m8.year >= 2026,
+          f"mtime={m8}")
+
+    # ── Безопасность: ни один файл не удалён/перемещён ──
+    snap_after = snapshot_tree(base21)
+    before_keys = set(snap_before.keys())
+    after_keys = set(snap_after.keys())
+    deleted = before_keys - after_keys
+    check("R21-safety", "ни один файл/папка не удалён",
+          len(deleted) == 0,
+          f"удалены: {sorted(deleted)}")
+
+    n_files = len([v for v in snap_after.values() if v["type"] == "file"])
+    check("R21-count", f"все {n_files} файлов на месте",
+          n_files == 14,
+          f"файлов: {n_files}")
+
+    # ── Идемпотентность: повторный --refine --apply ──
+    print("\n  ── R21 идемпотентность ──")
+    r_idem = run_script_refine(base21, "--apply")
+    check("R21-idem", "повторный --refine --apply: 0 обработано",
+          "Успешно обработано:          0" in r_idem.stdout,
+          r_idem.stdout[-300:] if r_idem.stdout else "нет вывода")
+
+
 def test_static_analysis():
     """Статический анализ: нет опасных операций в коде."""
     print("\n── Статический анализ: нет опасных операций ──")
@@ -562,6 +813,8 @@ if __name__ == "__main__":
         test_R14b_base_dir_date(tmp_root)
         test_R18_dash_dates_not_matched(tmp_root)
         test_R19_date_ranges(tmp_root)
+        test_R20_compact_dates_rejected(tmp_root)
+        test_R21_refine_mode(tmp_root)
 
     finally:
         # Очистка временной директории
