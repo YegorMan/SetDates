@@ -26,6 +26,7 @@
 """
 
 import os
+import re
 import sys
 import subprocess
 import shutil
@@ -39,7 +40,7 @@ try:
 except ImportError:
     HAS_PILLOW = False
 
-SCRIPT = Path(__file__).parent / "set_dates_from_folders (4).py"
+SCRIPT = Path(__file__).parent / "set_dates_from_folders.py"
 
 # ─── Utility ──────────────────────────────────────────────────────────────────
 
@@ -115,6 +116,25 @@ def get_exif_date(path: Path) -> str:
 
 def get_mtime(path: Path) -> datetime:
     return datetime.fromtimestamp(path.stat().st_mtime)
+
+
+def set_file_date(path: Path, dt: datetime) -> None:
+    """Устанавливает EXIF (DateTimeOriginal и др.) и mtime/atime файла."""
+    ts = dt.timestamp()
+    # EXIF в формате exiftool: YYYY:MM:DD HH:MM:SS
+    exif_str = dt.strftime("%Y:%m:%d %H:%M:%S")
+    subprocess.run(
+        [
+            "exiftool", "-q", "-overwrite_original",
+            "-DateTimeOriginal=" + exif_str,
+            "-CreateDate=" + exif_str,
+            "-ModifyDate=" + exif_str,
+            str(path),
+        ],
+        capture_output=True,
+        check=True,
+    )
+    os.utime(path, (ts, ts))
 
 
 # ─── Setup ────────────────────────────────────────────────────────────────────
@@ -758,6 +778,38 @@ def test_R21_refine_mode(tmp_root: Path):
           r_idem.stdout[-300:] if r_idem.stdout else "нет вывода")
 
 
+def test_R21_refine_no_utoch_when_date_already_set(tmp_root: Path):
+    """R21: --refine не выводит [УТОЧНЕНИЕ], если дата из имени файла уже установлена в файле."""
+    print("\n── R21: --refine без вывода при совпадении даты ──")
+
+    base = tmp_root / "test_refine_no_utoch"
+    if base.exists():
+        shutil.rmtree(base)
+
+    # Один файл: дата в папке и в имени совпадают, предпочтительна дата из имени
+    folder = base / "2019.01.02 Событие"
+    f = folder / "IMG_20190102_160000.jpg"
+    create_jpg(f)
+    # Устанавливаем в файле ту же дату, что в имени (2019-01-02 16:00:00)
+    set_file_date(f, datetime(2019, 1, 2, 16, 0, 0))
+
+    r = run_script_refine(base)
+
+    check("R21-no-utoch-exit", "--refine завершился без ошибок",
+          r.returncode == 0,
+          r.stderr if r.stderr else r.stdout[-300:])
+
+    # Для этого файла расхождение не выводится — в выводе не должно быть [УТОЧНЕНИЕ]
+    check("R21-no-utoch-hide", "при совпадении даты [УТОЧНЕНИЕ] не выводится",
+          "[УТОЧНЕНИЕ]" not in r.stdout,
+          r.stdout[-500:] if r.stdout else "нет вывода")
+
+    # В итогах должна быть строка «Дата уже совпадает: 1»
+    check("R21-no-utoch-stats", "в итогах «Дата уже совпадает: 1»",
+          bool(re.search(r"Дата уже совпадает:\s*1\b", r.stdout)),
+          r.stdout[-400:] if r.stdout else "нет вывода")
+
+
 def test_static_analysis():
     """Статический анализ: нет опасных операций в коде."""
     print("\n── Статический анализ: нет опасных операций ──")
@@ -815,6 +867,7 @@ if __name__ == "__main__":
         test_R19_date_ranges(tmp_root)
         test_R20_compact_dates_rejected(tmp_root)
         test_R21_refine_mode(tmp_root)
+        test_R21_refine_no_utoch_when_date_already_set(tmp_root)
 
     finally:
         # Очистка временной директории
