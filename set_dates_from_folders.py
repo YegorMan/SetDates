@@ -33,13 +33,21 @@
   - Python 3.8+
   - exiftool (https://exiftool.org/)
 
+Режим --refine:
+  Уточняет даты из имён медиафайлов (IMG_YYYYMMDD_HHMMSS и т.д.).
+  Если дата из имени файла согласуется с датой папки на уровне точности
+  папки (год/месяц/день/диапазон) и содержит более подробную информацию
+  (дату + время) — используется дата из имени файла.
+  Время считается локальным (MSK).
+
 Примеры:
   python3 set_dates_from_folders.py /path/to/photos              # dry-run
   python3 set_dates_from_folders.py /path/to/photos --apply       # применить
-  python3 set_dates_from_folders.py /path/to/photos --apply -v
+  python3 set_dates_from_folders.py /path/to/photos --refine      # показать уточнения
+  python3 set_dates_from_folders.py /path/to/photos --refine --apply  # применить уточнения
 
 Поведение:
-  Если даты файла уже совпадают с датой из папки — файл пропускается.
+  Если даты файла уже совпадают с целевой датой — файл пропускается.
 """
 
 import os
@@ -48,6 +56,7 @@ import sys
 import subprocess
 import argparse
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Tuple
@@ -83,6 +92,28 @@ DATE_PATTERN = re.compile(
     r')'
 )
 
+# Регулярное выражение для извлечения даты/времени из имени файла.
+# Покрывает: IMG_20190102_160000, VID_20190102_160000, PXL_20190102_160000,
+#             Screenshot_20190102-160000, 20190102_160000 и т.д.
+FILENAME_DATETIME_PATTERN = re.compile(
+    r'(?:^|[_\-])(\d{4})(\d{2})(\d{2})[_\-](\d{2})(\d{2})(\d{2})(?:[_\-.]|$)'
+)
+
+# Парсинг суффикса диапазона после начальной даты в имени папки.
+# Примеры: -05 (дни), -03 (месяцы), -02.11 (мес.дни)
+RANGE_PATTERN = re.compile(
+    r'-(\d{2})(?:\.(\d{2}))?'
+)
+
+
+@dataclass
+class FolderDateInfo:
+    """Информация о дате из имени папки: начальная дата, точность и диапазон."""
+    start: datetime          # начальная дата
+    precision: str           # "year" | "month" | "day"
+    end: Optional[datetime]  # конец диапазона или None
+
+
 # ─── Функции ─────────────────────────────────────────────────────────────────
 
 
@@ -112,6 +143,147 @@ def extract_date_from_name(name: str) -> Optional[datetime]:
         return datetime(year, month, day, 12, 0, 0)
     except ValueError:
         return None
+
+
+def extract_folder_date_info(name: str) -> Optional[FolderDateInfo]:
+    """
+    Извлекает дату из имени папки с информацией о точности и диапазоне.
+
+    Возвращает FolderDateInfo или None.
+    """
+    match = DATE_PATTERN.match(name)
+    if not match:
+        return None
+
+    year = int(match.group(1))
+    month_s = match.group(2)
+    day_s = match.group(3)
+
+    month = int(month_s) if month_s else 1
+    day = int(day_s) if day_s else 1
+
+    try:
+        start = datetime(year, month, day, 12, 0, 0)
+    except ValueError:
+        return None
+
+    # Определяем точность
+    if day_s:
+        precision = "day"
+    elif month_s:
+        precision = "month"
+    else:
+        precision = "year"
+
+    # Парсим диапазон (суффикс после начальной даты)
+    end = None
+    end_pos = match.end()
+    rest = name[end_pos:]
+    range_match = RANGE_PATTERN.match(rest)
+    if range_match:
+        r1 = int(range_match.group(1))
+        r2_s = range_match.group(2)
+
+        try:
+            if precision == "day" and r2_s:
+                # YYYY.MM.DD-MM.DD — кросс-месячный диапазон
+                end = datetime(year, r1, int(r2_s), 12, 0, 0)
+            elif precision == "day":
+                # YYYY.MM.DD-DD — диапазон дней в том же месяце
+                end = datetime(year, month, r1, 12, 0, 0)
+            elif precision == "month":
+                # YYYY.MM-MM — диапазон месяцев
+                end = datetime(year, r1, 1, 12, 0, 0)
+        except ValueError:
+            end = None  # невалидный диапазон — игнорируем
+
+    return FolderDateInfo(start=start, precision=precision, end=end)
+
+
+def extract_datetime_from_filename(stem: str) -> Optional[datetime]:
+    """
+    Извлекает полную дату+время (YYYYMMDD_HHMMSS) из основы имени файла.
+
+    Покрывает паттерны: IMG_20190102_160000, VID_20190102_160000,
+    PXL_20190102_160000, Screenshot_20190102-160000, 20190102_160000.
+
+    Время считается локальным (MSK).
+    Возвращает datetime или None.
+    """
+    match = FILENAME_DATETIME_PATTERN.search(stem)
+    if not match:
+        return None
+
+    try:
+        return datetime(
+            int(match.group(1)),  # year
+            int(match.group(2)),  # month
+            int(match.group(3)),  # day
+            int(match.group(4)),  # hour
+            int(match.group(5)),  # minute
+            int(match.group(6)),  # second
+        )
+    except ValueError:
+        return None
+
+
+def is_consistent(folder_info: FolderDateInfo, file_dt: datetime) -> bool:
+    """
+    Проверяет, согласуется ли дата из имени файла с датой папки
+    на уровне точности папки (включая диапазоны).
+
+    Возвращает True, если дата из файла может уточнить дату папки.
+    """
+    fs = folder_info.start
+
+    if folder_info.precision == "year":
+        if folder_info.end is not None:
+            # Диапазон лет (теоретически) — маловероятно, но на всякий случай
+            return fs.year <= file_dt.year <= folder_info.end.year
+        return file_dt.year == fs.year
+
+    elif folder_info.precision == "month":
+        if file_dt.year != fs.year:
+            return False
+        if folder_info.end is not None:
+            # YYYY.MM-MM — диапазон месяцев
+            return fs.month <= file_dt.month <= folder_info.end.month
+        return file_dt.month == fs.month
+
+    elif folder_info.precision == "day":
+        if file_dt.year != fs.year:
+            return False
+        if folder_info.end is not None:
+            # YYYY.MM.DD-DD или YYYY.MM.DD-MM.DD — диапазон дней
+            file_date = datetime(file_dt.year, file_dt.month, file_dt.day, 12, 0, 0)
+            return fs <= file_date <= folder_info.end
+        return (file_dt.year == fs.year and
+                file_dt.month == fs.month and
+                file_dt.day == fs.day)
+
+    return False
+
+
+def find_folder_date_info_for_file(
+    file_path: Path, base_dir: Path
+) -> Tuple[Optional[FolderDateInfo], Optional[str]]:
+    """
+    Находит FolderDateInfo для файла, поднимаясь по дереву каталогов.
+
+    Возвращает (FolderDateInfo, имя_источника) или (None, None).
+    """
+    current = file_path.parent.resolve()
+    base = base_dir.resolve()
+
+    while True:
+        info = extract_folder_date_info(current.name)
+        if info is not None:
+            return info, current.name
+        if current == base or current == current.parent:
+            break
+        current = current.parent
+
+    return None, None
 
 
 def find_date_for_file(file_path: Path, base_dir: Path) -> Tuple[Optional[datetime], Optional[str], str]:
@@ -392,55 +564,35 @@ def check_filesystem_date(file_path: Path, target_date: datetime) -> bool:
         return False
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description='Устанавливает даты файлов (mtime/atime + EXIF) на основе имён папок.',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Примеры:
-  %(prog)s /photos                    # показать, что будет сделано (dry-run)
-  %(prog)s /photos --apply            # применить изменения
-  %(prog)s /photos --apply -v            # применить с подробным выводом
-        """
-    )
-    parser.add_argument(
-        'directory',
-        help='Корневая директория с папками фотографий'
-    )
-    parser.add_argument(
-        '--apply',
-        action='store_true',
-        default=False,
-        help='Применить изменения (по умолчанию — dry-run, только показ)'
-    )
-    parser.add_argument(
-        '--verbose', '-v',
-        action='store_true',
-        default=False,
-        help='Подробный вывод'
-    )
+def _apply_date(file_path: Path, date: datetime, exif: Optional['ExifToolBatch'],
+                 log: logging.Logger) -> Tuple[bool, str]:
+    """
+    Применяет дату к файлу: EXIF + mtime/atime.
 
-    args = parser.parse_args()
+    БЕЗОПАСНОСТЬ: НЕ удаляет, НЕ переименовывает, НЕ перемещает файлы.
+    Возвращает (success, extra_info).
+    """
+    # 1. EXIF-метаданные
+    exif_ok = True
+    if exif:
+        exif_ok, exif_msg = exif.set_date(file_path, date)
+        if not exif_ok:
+            log.debug(f"    EXIF не записан: {exif_msg}")
 
-    # ─── Настройка логирования ────────────────────────────────────────────
-    log_level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(
-        level=log_level,
-        format='%(message)s',
-        stream=sys.stdout
-    )
-    log = logging.getLogger('set_dates')
+    # 2. Даты файловой системы (mtime/atime) — ВСЕГДА
+    #    Вызываем ПОСЛЕ exiftool, т.к. exiftool меняет mtime на «сейчас»
+    fs_ok, fs_msg = set_filesystem_dates(file_path, date)
 
-    # ─── Валидация ────────────────────────────────────────────────────────
-    base_dir = Path(args.directory).resolve()
+    extra = ""
+    if not fs_ok:
+        return False, fs_msg
+    if exif and not exif_ok:
+        extra = "  (EXIF не записан)"
+    return True, extra
 
-    if not base_dir.exists():
-        log.error(f"ОШИБКА: Директория не существует: {base_dir}")
-        sys.exit(1)
 
-    if not base_dir.is_dir():
-        log.error(f"ОШИБКА: Не является директорией: {base_dir}")
-        sys.exit(1)
+def run_default_mode(args, base_dir: Path, log: logging.Logger) -> int:
+    """Основной режим: установка дат из имён папок (без --refine)."""
 
     has_exiftool = check_exiftool()
 
@@ -532,28 +684,13 @@ def main():
             log.info(f"            Будет: {date_display}")
             log.info("")
         else:
-            # 1. EXIF-метаданные (если exiftool доступен)
-            exif_ok = True
-            if exif:
-                exif_ok, exif_msg = exif.set_date(file_path, date)
-                if not exif_ok:
-                    log.debug(f"    EXIF не записан: {exif_msg}")
-
-            # 2. Даты файловой системы (mtime/atime) — ВСЕГДА
-            #    Вызываем ПОСЛЕ exiftool, т.к. exiftool меняет mtime на «сейчас»
-            fs_ok, fs_msg = set_filesystem_dates(file_path, date)
-
-            if fs_ok:
+            ok, extra = _apply_date(file_path, date, exif, log)
+            if ok:
                 stats['success'] += 1
-                extra = ""
-                if has_exiftool and not exif_ok:
-                    extra = "  (EXIF не записан)"
-                elif not has_exiftool:
-                    extra = "  (только mtime/atime)"
                 log.info(f"  ✓ {rel_path}  →  {date_display}{extra}")
             else:
                 stats['failed'] += 1
-                log.error(f"  ✗ {rel_path}  →  ОШИБКА: {fs_msg}")
+                log.error(f"  ✗ {rel_path}  →  ОШИБКА: {extra}")
 
     # ─── Завершаем exiftool ───────────────────────────────────────────────
     if exif:
@@ -585,6 +722,220 @@ def main():
     log.info("=" * 70)
 
     return 0 if stats['failed'] == 0 else 1
+
+
+def run_refine_mode(args, base_dir: Path, log: logging.Logger) -> int:
+    """
+    Режим --refine: уточнение дат из имён медиафайлов.
+
+    Для каждого файла:
+      1. Определяет дату из папки (с точностью и диапазоном).
+      2. Извлекает дату+время из имени файла (YYYYMMDD_HHMMSS).
+      3. Если дата из файла согласуется с папкой и более точна — использует её.
+      4. Иначе — использует дату папки.
+
+    Время в именах файлов считается локальным (MSK).
+
+    БЕЗОПАСНОСТЬ: НЕ удаляет, НЕ переименовывает, НЕ перемещает файлы.
+    """
+
+    has_exiftool = check_exiftool()
+
+    if not has_exiftool:
+        log.error("ОШИБКА: exiftool не найден. Установите его:")
+        log.error("  Ubuntu/Debian: sudo apt install libimage-exiftool-perl")
+        log.error("  macOS:         brew install exiftool")
+        log.error("  Windows:       https://exiftool.org/")
+        sys.exit(1)
+
+    # ─── Режим работы ─────────────────────────────────────────────────────
+    if args.apply:
+        mode_str = "REFINE + ПРИМЕНЕНИЕ"
+    else:
+        mode_str = "REFINE (только просмотр уточнений, файлы НЕ изменяются)"
+
+    log.info("=" * 70)
+    log.info(f"  Режим: {mode_str}")
+    log.info(f"  Директория: {base_dir}")
+    log.info("=" * 70)
+    log.info("")
+
+    # ─── Поиск файлов ─────────────────────────────────────────────────────
+    log.info("Сканирование файлов...")
+    all_files = find_files(base_dir)
+    log.info(f"Найдено файлов: {len(all_files)}")
+    log.info("")
+
+    exif = ExifToolBatch() if has_exiftool else None
+
+    PRECISION_LABELS = {"year": "год", "month": "месяц", "day": "день"}
+
+    stats = {
+        'total': len(all_files),
+        'without_folder_date': 0,
+        'no_filename_dt': 0,
+        'refined': 0,
+        'conflict': 0,
+        'skipped_match': 0,
+        'success': 0,
+        'failed': 0,
+    }
+
+    for file_path in all_files:
+        rel_path = file_path.relative_to(base_dir)
+
+        # 1. Ищем дату из папки с точностью и диапазоном
+        folder_info, folder_name = find_folder_date_info_for_file(file_path, base_dir)
+        if folder_info is None:
+            stats['without_folder_date'] += 1
+            log.debug(f"  ПРОПУСК (нет даты в пути): {rel_path}")
+            continue
+
+        folder_display = folder_info.start.strftime('%Y-%m-%d %H:%M:%S')
+        prec_label = PRECISION_LABELS.get(folder_info.precision, folder_info.precision)
+
+        # 2. Извлекаем дату+время из имени файла
+        file_dt = extract_datetime_from_filename(file_path.stem)
+
+        if file_dt is None:
+            # Нет даты в имени файла — используем дату папки
+            stats['no_filename_dt'] += 1
+            final_date = folder_info.start
+            log.debug(f"  {rel_path} — нет даты в имени файла, папка: {folder_display}")
+        elif is_consistent(folder_info, file_dt):
+            # Дата согласуется — уточняем
+            final_date = file_dt
+            stats['refined'] += 1
+            file_display = file_dt.strftime('%Y-%m-%d %H:%M:%S')
+
+            log.info(f"  [УТОЧНЕНИЕ] {rel_path}")
+            log.info(f"      Папка:     {folder_name} → {folder_display} (точность: {prec_label})")
+            log.info(f"      Файл:      {file_path.name} → {file_display}")
+            log.info(f"      Результат: {file_display}")
+            log.info("")
+        else:
+            # Конфликт — используем дату папки
+            final_date = folder_info.start
+            stats['conflict'] += 1
+            file_display = file_dt.strftime('%Y-%m-%d %H:%M:%S')
+
+            log.info(f"  [КОНФЛИКТ] {rel_path}")
+            log.info(f"      Папка:     {folder_name} → {folder_display} (точность: {prec_label})")
+            log.info(f"      Файл:      {file_path.name} → {file_display}")
+            log.info(f"      Результат: {folder_display} (дата из файла не согласуется)")
+            log.info("")
+
+        # 3. Проверяем, нужно ли обновление
+        existing_exif = exif.read_date(file_path) if exif else None
+        fs_matches = check_filesystem_date(file_path, final_date)
+        exif_needs_update = existing_exif is not None and existing_exif != final_date
+
+        if fs_matches and not exif_needs_update:
+            stats['skipped_match'] += 1
+            continue
+
+        # 4. Применяем (или показываем)
+        if args.apply:
+            ok, extra = _apply_date(file_path, final_date, exif, log)
+            date_display = final_date.strftime('%Y-%m-%d %H:%M:%S')
+            if ok:
+                stats['success'] += 1
+                log.info(f"  ✓ {rel_path}  →  {date_display}{extra}")
+            else:
+                stats['failed'] += 1
+                log.error(f"  ✗ {rel_path}  →  ОШИБКА: {extra}")
+
+    # ─── Завершаем exiftool ───────────────────────────────────────────────
+    if exif:
+        exif.close()
+
+    # ─── Итоги ────────────────────────────────────────────────────────────
+    log.info("")
+    log.info("=" * 70)
+    log.info("  ИТОГИ (--refine):")
+    log.info(f"    Всего файлов:                {stats['total']}")
+    log.info(f"    Без даты в папке:            {stats['without_folder_date']}")
+    log.info(f"    Без даты в имени файла:      {stats['no_filename_dt']}")
+    log.info(f"    Уточнено из имени файла:     {stats['refined']}")
+    log.info(f"    Конфликт (дата папки):       {stats['conflict']}")
+    log.info(f"    Дата уже совпадает:          {stats['skipped_match']}")
+
+    if args.apply:
+        log.info(f"    Успешно обработано:          {stats['success']}")
+        log.info(f"    Ошибки:                      {stats['failed']}")
+    else:
+        need_update = stats['refined'] + stats['conflict'] + stats['no_filename_dt'] - stats['skipped_match']
+        log.info("")
+        log.info("  Запустите с --refine --apply, чтобы применить изменения.")
+
+    log.info("=" * 70)
+
+    return 0 if stats['failed'] == 0 else 1
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Устанавливает даты файлов (mtime/atime + EXIF) на основе имён папок.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Примеры:
+  %(prog)s /photos                        # dry-run (показать что будет)
+  %(prog)s /photos --apply                # применить даты из папок
+  %(prog)s /photos --apply -v             # применить с подробным выводом
+  %(prog)s /photos --refine               # показать уточнения из имён файлов
+  %(prog)s /photos --refine --apply       # применить уточнённые даты
+        """
+    )
+    parser.add_argument(
+        'directory',
+        help='Корневая директория с папками фотографий'
+    )
+    parser.add_argument(
+        '--apply',
+        action='store_true',
+        default=False,
+        help='Применить изменения (по умолчанию — dry-run, только показ)'
+    )
+    parser.add_argument(
+        '--refine',
+        action='store_true',
+        default=False,
+        help='Уточнить даты из имён файлов (IMG_YYYYMMDD_HHMMSS и т.д.)'
+    )
+    parser.add_argument(
+        '--verbose', '-v',
+        action='store_true',
+        default=False,
+        help='Подробный вывод'
+    )
+
+    args = parser.parse_args()
+
+    # ─── Настройка логирования ────────────────────────────────────────────
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format='%(message)s',
+        stream=sys.stdout
+    )
+    log = logging.getLogger('set_dates')
+
+    # ─── Валидация ────────────────────────────────────────────────────────
+    base_dir = Path(args.directory).resolve()
+
+    if not base_dir.exists():
+        log.error(f"ОШИБКА: Директория не существует: {base_dir}")
+        sys.exit(1)
+
+    if not base_dir.is_dir():
+        log.error(f"ОШИБКА: Не является директорией: {base_dir}")
+        sys.exit(1)
+
+    # ─── Выбор режима ─────────────────────────────────────────────────────
+    if args.refine:
+        return run_refine_mode(args, base_dir, log)
+    else:
+        return run_default_mode(args, base_dir, log)
 
 
 if __name__ == '__main__':
