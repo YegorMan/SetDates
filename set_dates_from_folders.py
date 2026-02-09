@@ -808,6 +808,14 @@ def run_refine_mode(args, base_dir: Path, log: logging.Logger) -> int:
             stats['refined'] += 1
             file_display = file_dt.strftime('%Y-%m-%d %H:%M:%S')
 
+            # Не выводить расхождение, если в файле уже установлена эта дата
+            existing_exif = exif.read_date(file_path) if exif else None
+            fs_matches = check_filesystem_date(file_path, final_date)
+            exif_needs_update = existing_exif is not None and existing_exif != final_date
+            if fs_matches and not exif_needs_update:
+                stats['skipped_match'] += 1
+                continue
+
             log.info(f"  [УТОЧНЕНИЕ] {rel_path}")
             log.info(f"      Папка:     {folder_name} → {folder_display} (точность: {prec_label})")
             log.info(f"      Файл:      {file_path.name} → {file_display}")
