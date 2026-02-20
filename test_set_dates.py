@@ -152,7 +152,6 @@ def set_file_date(path: Path, dt: datetime) -> None:
                 str(path),
             ],
             capture_output=True,
-            check=True,
         )
     os.utime(path, (ts, ts))
 
