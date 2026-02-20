@@ -145,7 +145,7 @@ def set_file_date(path: Path, dt: datetime) -> None:
         exif_str = dt.strftime("%Y:%m:%d %H:%M:%S")
         subprocess.run(
             [
-                "exiftool", "-q", "-overwrite_original",
+                "exiftool", "-q", "-overwrite_original", "-m",
                 "-DateTimeOriginal=" + exif_str,
                 "-CreateDate=" + exif_str,
                 "-ModifyDate=" + exif_str,
