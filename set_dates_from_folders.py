@@ -398,6 +398,7 @@ def set_exif_date(file_path: Path, date: datetime) -> Tuple[bool, str]:
     # Устанавливаем все основные теги дат
     cmd.extend([
         f'-DateTimeOriginal={date_str}',
+        f'-CreationDate={date_str}',
         f'-CreateDate={date_str}',
         f'-ModifyDate={date_str}',
         # Для видеофайлов QuickTime — также запишем в Track/Media
@@ -534,6 +535,7 @@ class ExifToolBatch:
         args = ['-overwrite_original']
         args.extend([
             f'-DateTimeOriginal={date_str}',
+            f'-CreationDate={date_str}',
             f'-CreateDate={date_str}',
             f'-ModifyDate={date_str}',
             f'-Track:CreateDate={date_str}',

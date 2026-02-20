@@ -123,6 +123,17 @@ def get_exif_date(path: Path) -> str:
     return r.stdout.strip()
 
 
+def get_exif_field(path: Path, field: str) -> str:
+    """Читает произвольное поле EXIF/XMP через exiftool. Возвращает пустую строку если поле отсутствует."""
+    if not HAS_EXIFTOOL:
+        return ""
+    r = subprocess.run(
+        ["exiftool", "-s3", f"-{field}", str(path)],
+        capture_output=True, text=True,
+    )
+    return r.stdout.strip()
+
+
 def get_mtime(path: Path) -> datetime:
     return datetime.fromtimestamp(path.stat().st_mtime)
 
@@ -910,12 +921,54 @@ def test_R22_preserve_time_when_date_matches(tmp_root: Path):
           f"факт={actual_mtime.strftime('%Y-%m-%d')}")
 
 
+def test_R23_creation_date_set(tmp_root: Path):
+    """R23: скрипт записывает CreationDate (приоритет #4 в Immich) для HEIC/MOV."""
+    print("\n── R23: CreationDate выставлен (для HEIC/QuickTime) ──")
+
+    base23 = tmp_root / "test_R23_creation_date"
+    if base23.exists():
+        shutil.rmtree(base23)
+
+    folder = base23 / "2024.03.15 Фото"
+    f = folder / "photo.jpg"
+    create_jpg(f)
+
+    r = run_script(base23, "--apply")
+    check("R23-apply", "--apply завершился без ошибок",
+          r.returncode == 0,
+          r.stderr if r.stderr else r.stdout[-200:])
+
+    expected_dt = datetime(2024, 3, 15, 12, 0, 0)
+    expected_str = expected_dt.strftime("%Y:%m:%d %H:%M:%S")
+
+    # Проверяем CreationDate
+    raw = get_exif_field(f, "CreationDate")
+    check("R23-creation-date",
+          f"CreationDate выставлен в {expected_str}",
+          raw[:19] == expected_str if raw else False,
+          f"факт={raw!r}")
+
+    # Проверяем DateTimeOriginal — должен тоже быть выставлен
+    raw_dto = get_exif_date(f)
+    check("R23-dto",
+          f"DateTimeOriginal выставлен в {expected_str}",
+          raw_dto[:19] == expected_str if raw_dto else False,
+          f"факт={raw_dto!r}")
+
+    # Проверяем CreateDate
+    raw_cd = get_exif_field(f, "CreateDate")
+    check("R23-create-date",
+          f"CreateDate выставлен в {expected_str}",
+          raw_cd[:19] == expected_str if raw_cd else False,
+          f"факт={raw_cd!r}")
+
+
 def test_static_analysis():
     """Статический анализ: нет опасных операций в коде."""
     print("\n── Статический анализ: нет опасных операций ──")
     import ast
 
-    source = SCRIPT.read_text()
+    source = SCRIPT.read_text(encoding='utf-8')
     tree = ast.parse(source)
 
     dangerous = {"remove", "unlink", "rmdir", "rmtree", "rename",
@@ -975,6 +1028,7 @@ if __name__ == "__main__":
             test_R21_refine_mode(tmp_root)
             test_R21_refine_no_utoch_when_date_already_set(tmp_root)
             test_R22_preserve_time_when_date_matches(tmp_root)
+            test_R23_creation_date_set(tmp_root)
 
     finally:
         # Очистка временной директории
