@@ -564,6 +564,23 @@ def check_filesystem_date(file_path: Path, target_date: datetime) -> bool:
         return False
 
 
+def _mtime_date_matches(file_path: Path, target_date: datetime) -> bool:
+    """
+    Проверяет, совпадает ли ДАТА (год-месяц-день) mtime файла с целевой датой.
+
+    В отличие от check_filesystem_date, игнорирует время — только дата.
+    Используется, когда дата взята из имени папки: если файл уже несёт
+    правильную дату (пусть и с другим временем), перезатирать время не нужно.
+    """
+    try:
+        mtime_dt = datetime.fromtimestamp(file_path.stat().st_mtime)
+        return (mtime_dt.year == target_date.year and
+                mtime_dt.month == target_date.month and
+                mtime_dt.day == target_date.day)
+    except OSError:
+        return False
+
+
 def _apply_date(file_path: Path, date: datetime, exif: Optional['ExifToolBatch'],
                  log: logging.Logger) -> Tuple[bool, str]:
     """
@@ -667,6 +684,21 @@ def run_default_mode(args, base_dir: Path, log: logging.Logger) -> int:
             stats['skipped_match'] += 1
             log.info(f"  ⏭ {rel_path}")
             log.info(f"            Дата уже установлена: {date_display}")
+            log.info("")
+            continue
+
+        # Если дата взята из папки и дата (год-месяц-день) mtime уже совпадает —
+        # файл содержит правильную дату с уточнённым временем; перезатирать его не нужно.
+        if source_type == "folder" and _mtime_date_matches(file_path, date):
+            stats['skipped_match'] += 1
+            try:
+                mtime_display = datetime.fromtimestamp(
+                    file_path.stat().st_mtime
+                ).strftime('%Y-%m-%d %H:%M:%S')
+            except OSError:
+                mtime_display = date_display
+            log.info(f"  ⏭ {rel_path}")
+            log.info(f"            Дата уже установлена: {mtime_display}")
             log.info("")
             continue
 

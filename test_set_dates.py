@@ -40,6 +40,13 @@ try:
 except ImportError:
     HAS_PILLOW = False
 
+try:
+    HAS_EXIFTOOL = subprocess.run(
+        ["exiftool", "-ver"], capture_output=True, timeout=10
+    ).returncode == 0
+except FileNotFoundError:
+    HAS_EXIFTOOL = False
+
 SCRIPT = Path(__file__).parent / "set_dates_from_folders.py"
 
 # ─── Utility ──────────────────────────────────────────────────────────────────
@@ -107,6 +114,8 @@ def create_txt(path: Path, content: str = "test"):
 
 
 def get_exif_date(path: Path) -> str:
+    if not HAS_EXIFTOOL:
+        return ""
     r = subprocess.run(
         ["exiftool", "-s3", "-DateTimeOriginal", str(path)],
         capture_output=True, text=True,
@@ -121,19 +130,19 @@ def get_mtime(path: Path) -> datetime:
 def set_file_date(path: Path, dt: datetime) -> None:
     """Устанавливает EXIF (DateTimeOriginal и др.) и mtime/atime файла."""
     ts = dt.timestamp()
-    # EXIF в формате exiftool: YYYY:MM:DD HH:MM:SS
-    exif_str = dt.strftime("%Y:%m:%d %H:%M:%S")
-    subprocess.run(
-        [
-            "exiftool", "-q", "-overwrite_original",
-            "-DateTimeOriginal=" + exif_str,
-            "-CreateDate=" + exif_str,
-            "-ModifyDate=" + exif_str,
-            str(path),
-        ],
-        capture_output=True,
-        check=True,
-    )
+    if HAS_EXIFTOOL:
+        exif_str = dt.strftime("%Y:%m:%d %H:%M:%S")
+        subprocess.run(
+            [
+                "exiftool", "-q", "-overwrite_original",
+                "-DateTimeOriginal=" + exif_str,
+                "-CreateDate=" + exif_str,
+                "-ModifyDate=" + exif_str,
+                str(path),
+            ],
+            capture_output=True,
+            check=True,
+        )
     os.utime(path, (ts, ts))
 
 
@@ -810,6 +819,97 @@ def test_R21_refine_no_utoch_when_date_already_set(tmp_root: Path):
           r.stdout[-400:] if r.stdout else "нет вывода")
 
 
+def test_R22_unit_date_comparison():
+    """R22-unit: _mtime_date_matches сравнивает только дату (год-месяц-день), игнорируя время."""
+    print("\n── R22-unit: _mtime_date_matches (без exiftool) ──")
+
+    import sys, tempfile, os
+    sys.path.insert(0, str(SCRIPT.parent))
+    from set_dates_from_folders import _mtime_date_matches
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+        tmp_path = Path(tmp.name)
+
+    try:
+        folder_date = datetime(2023, 5, 15, 12, 0, 0)   # дата из папки (полдень)
+        file_time   = datetime(2023, 5, 15, 16, 30, 0)  # время уже есть в файле
+
+        os.utime(tmp_path, (file_time.timestamp(), file_time.timestamp()))
+
+        # Одна и та же дата, разное время → должна совпадать
+        result = _mtime_date_matches(tmp_path, folder_date)
+        check("R22-unit-same-day",
+              "_mtime_date_matches: тот же день (16:30 vs 12:00) → True",
+              result == True,
+              f"вернула {result!r}")
+
+        # Другой день → не должна совпадать
+        other_date = datetime(2023, 5, 14, 12, 0, 0)
+        result2 = _mtime_date_matches(tmp_path, other_date)
+        check("R22-unit-diff-day",
+              "_mtime_date_matches: другой день (15 vs 14) → False",
+              result2 == False,
+              f"вернула {result2!r}")
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def test_R22_preserve_time_when_date_matches(tmp_root: Path):
+    """R22: если у файла уже установлена ДАТА из папки (день совпадает),
+    то ВРЕМЯ файла не должно быть перезатёрто при применении даты из папки.
+
+    Сценарий:
+      - папка: 2023.05.15 Отпуск → дата = 2023-05-15 12:00:00 (полдень по умолчанию)
+      - файл уже имеет mtime/EXIF = 2023-05-15 16:30:00 (совпадает ДАТА, не ВРЕМЯ)
+      Ожидание: скрипт не перезатирает 16:30:00, файл остаётся без изменений.
+    """
+    print("\n── R22: Время файла сохраняется, если дата из папки уже совпадает ──")
+
+    base22 = tmp_root / "test_R22_preserve_time"
+    if base22.exists():
+        shutil.rmtree(base22)
+
+    folder = base22 / "2023.05.15 Отпуск"
+    f = folder / "photo.jpg"
+    create_jpg(f)
+
+    # Устанавливаем в файле ту же ДАТУ (2023-05-15), но другое ВРЕМЯ (16:30:00)
+    existing_time = datetime(2023, 5, 15, 16, 30, 0)
+    set_file_date(f, existing_time)
+
+    mtime_before = get_mtime(f)
+    exif_before = get_exif_date(f)
+
+    # Запускаем скрипт: дата папки — 2023-05-15 (12:00 по умолчанию),
+    # файл уже несёт 2023-05-15 — только время отличается.
+    r = run_script(base22, "--apply")
+    check("R22-apply", "--apply завершился без ошибок",
+          r.returncode == 0,
+          r.stderr if r.stderr else r.stdout[-200:])
+
+    actual_mtime = get_mtime(f)
+    actual_exif = get_exif_date(f)
+
+    # Ключевая проверка: mtime НЕ перезатёрт на 12:00
+    check("R22-mtime-preserved",
+          "mtime файла сохранён (16:30:00 не заменён на 12:00:00 из папки)",
+          actual_mtime.strftime("%Y-%m-%d %H:%M:%S") == "2023-05-15 16:30:00",
+          f"до={mtime_before.strftime('%Y-%m-%d %H:%M:%S')}, "
+          f"после={actual_mtime.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # EXIF тоже не должен быть перезатёрт
+    check("R22-exif-preserved",
+          "EXIF DateTimeOriginal сохранён (16:30:00 не заменён на 12:00:00)",
+          actual_exif == exif_before,
+          f"до={exif_before!r}, после={actual_exif!r}")
+
+    # Дата (день) при этом должна оставаться корректной
+    check("R22-date-correct",
+          "дата файла соответствует папке (2023-05-15)",
+          actual_mtime.strftime("%Y-%m-%d") == "2023-05-15",
+          f"факт={actual_mtime.strftime('%Y-%m-%d')}")
+
+
 def test_static_analysis():
     """Статический анализ: нет опасных операций в коде."""
     print("\n── Статический анализ: нет опасных операций ──")
@@ -853,21 +953,28 @@ if __name__ == "__main__":
         print(f"\nТестовая директория: {base}")
         print(f"Создана структура: {n_files} файлов, {n_dirs} папок")
 
-        # Все тесты
+        # Тесты, не требующие exiftool
         test_static_analysis()
-        test_R11_dry_run(base)
-        test_R16_invalid_dates(base)
-        test_R15_hidden(base)
-        test_apply_and_dates(base)
-        test_R12_idempotency(base)
-        test_R17_no_original_copies(base)
-        test_R08_R09_R10_safety(base, snap_before)
-        test_R14b_base_dir_date(tmp_root)
-        test_R18_dash_dates_not_matched(tmp_root)
-        test_R19_date_ranges(tmp_root)
-        test_R20_compact_dates_rejected(tmp_root)
-        test_R21_refine_mode(tmp_root)
-        test_R21_refine_no_utoch_when_date_already_set(tmp_root)
+        test_R22_unit_date_comparison()
+
+        if not HAS_EXIFTOOL:
+            print("\n  [SKIP] exiftool не найден — интеграционные тесты пропущены.")
+            print("         Установите exiftool и запустите снова для полной проверки.")
+        else:
+            test_R11_dry_run(base)
+            test_R16_invalid_dates(base)
+            test_R15_hidden(base)
+            test_apply_and_dates(base)
+            test_R12_idempotency(base)
+            test_R17_no_original_copies(base)
+            test_R08_R09_R10_safety(base, snap_before)
+            test_R14b_base_dir_date(tmp_root)
+            test_R18_dash_dates_not_matched(tmp_root)
+            test_R19_date_ranges(tmp_root)
+            test_R20_compact_dates_rejected(tmp_root)
+            test_R21_refine_mode(tmp_root)
+            test_R21_refine_no_utoch_when_date_already_set(tmp_root)
+            test_R22_preserve_time_when_date_matches(tmp_root)
 
     finally:
         # Очистка временной директории
